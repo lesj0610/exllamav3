@@ -265,6 +265,7 @@ class Job:
         self.embeddings = embeddings or []
         self.alt_rope_freqs = None
         self.alt_rope_offset = 0
+        self._prefill_params_keepalive = None
 
         # Pinned buffer for IDs during sampling
         self.current_pinned_ids = None
@@ -883,7 +884,7 @@ class Job:
             freqs, offset = generator.model.g_rope.get_mrope_freqs(
                 ids,
                 self.embeddings,
-                ids.shape[-1]  # + self.max_new_tokens
+                ids.shape[-1] + self.max_new_tokens
             )
             self.alt_rope_freqs = freqs
             self.alt_rope_offset = offset - ids.shape[-1]
@@ -991,24 +992,28 @@ class Job:
                     self.generator.draft_model.prefill(
                         input_ids = prefill_ids,
                         params = {
-                            "attn_mode": "flash_attn",
+                            "attn_mode": self.generator.attn_mode,
                             "block_table": seq.block_index_tensor,
                             "cache": self.generator.draft_cache,
                             "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32)
                         }
                     )
 
+                prefill_params = {
+                    "attn_mode": self.generator.attn_mode,
+                    "block_table": seq.block_index_tensor,
+                    "cache": self.generator.cache,
+                    "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
+                    "recurrent_states": self.recurrent_state,
+                    "indexed_embeddings": self.embeddings,
+                    "inv_freq": self.alt_rope_freqs,
+                }
+                self._prefill_params_keepalive = (
+                    prefill_params if self.generator.use_flashinfer_optimizations else None
+                )
                 self.generator.model.prefill(
                     input_ids = prefill_ids,
-                    params = {
-                        "attn_mode": "flash_attn",
-                        "block_table": seq.block_index_tensor,
-                        "cache": self.generator.cache,
-                        "cache_seqlens": torch.tensor([prefill_start], dtype = torch.int32),
-                        "recurrent_states": self.recurrent_state,
-                        "indexed_embeddings": self.embeddings,
-                        "inv_freq": self.alt_rope_freqs,
-                    }
+                    params = prefill_params,
                 )
 
                 seq.kv_position = prefill_end
@@ -1091,7 +1096,7 @@ class Job:
 
     def maybe_stash_recurrent(self, cache, interval):
         seq = self.sequences[0]
-        if seq.kv_position % interval == 0:
+        if seq.kv_position > 0 and seq.kv_position % interval == 0:
             last_page = (seq.kv_position - 1) // PAGE_SIZE
             page = seq.allocated_pages[last_page]
             assert page.kv_position == PAGE_SIZE
