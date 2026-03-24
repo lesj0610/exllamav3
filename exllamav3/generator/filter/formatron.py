@@ -22,6 +22,22 @@ def create_engine_vocabulary(
 ) -> kbnf.Vocabulary:
     vocab = tokenizer.get_vocab_dict()
     new_vocab = get_original_characters(vocab, vocab_processors)
+
+    # Some tokenizers reuse the same piece text for multiple token IDs. The
+    # string->id mapping keeps only the last ID, which drops earlier IDs from
+    # the derived kbnf vocabulary and can make valid model outputs look
+    # rejected. Reuse the bytes for duplicate strings to back-fill those IDs.
+    id_to_str = {v: k for k, v in vocab.items()}
+    str_to_bytes = {
+        id_to_str[id_]: b for id_, b in new_vocab.items() if id_ in id_to_str
+    }
+    full_size = tokenizer.tokenizer.get_vocab_size()
+    for i in range(full_size):
+        if i not in new_vocab:
+            token_str = tokenizer.tokenizer.id_to_token(i)
+            if token_str in str_to_bytes:
+                new_vocab[i] = str_to_bytes[token_str]
+
     return kbnf.Vocabulary(
         {k: kbnf.Token(v) for k, v in new_vocab.items()},
         {v: k for k, v in vocab.items()}
@@ -60,7 +76,12 @@ class FormatronFilter(Filter):
     def accept_token(self, token: int):
         if self._formatter.is_completed():
             return
-        self._formatter.accept_token(token)
+        try:
+            self._formatter.accept_token(token)
+        except ValueError:
+            # Surface the formatter/tokenizer mismatch as a clean job failure
+            # instead of crashing deeper in the generation loop.
+            raise
 
     def get_next_logit_mask(self) -> torch.Tensor:
         self._formatter.compute_allowed_tokens()

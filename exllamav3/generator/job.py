@@ -554,6 +554,20 @@ class Job:
 
             if emit_held:
                 if self.held_text != "":
+                    # Final reconstruction attempt before emitting. This covers
+                    # terminal emit paths (EOS, max_new_tokens, stop-string,
+                    # etc.) that bypass the incremental FFFD gate below.
+                    if "\ufffd" in self.held_text:
+                        test_decode = self.generator.tokenizer.decode(
+                            self.held_tokens.torch(),
+                            decode_special_tokens = self.decode_special_tokens
+                        )[0]
+                        if "\ufffd" not in test_decode:
+                            self.held_text = test_decode
+                        else:
+                            # Reconstruction failed. Strip residual replacement
+                            # chars rather than emitting broken text.
+                            self.held_text = test_decode.replace("\ufffd", "")
                     self.full_completion += self.held_text
                     r.update({ "text": self.held_text })
                     self.held_text = ""
@@ -653,17 +667,24 @@ class Job:
             return emit(results, emit_eos = True, emit_held = True, eos_reason = "end_filter")
 
         # Hold text if it contains an incomplete character
-        if 1 <= self.held_text.count("�") < 5:
+        if "\ufffd" in self.held_text:
             test_decode = self.generator.tokenizer.decode(
                 self.held_tokens.torch(),
                 decode_special_tokens = self.decode_special_tokens
             )[0]
-            if not "�" in test_decode:
+            if "\ufffd" not in test_decode:
                 self.held_text = test_decode
             else:
-                # Don't hold forever if a broken generation yields a replacement character but never completes
-                # the Unicode symbol
-                return emit(results, emit_held = (len(test_decode) > 20))
+                # Don't hold forever if a broken generation yields a replacement
+                # character but never completes the Unicode symbol. Use the
+                # held_text FFFD count rather than the decoded length so clean
+                # stop-buffered text does not trigger a false flush.
+                return emit(
+                    results,
+                    emit_held = not (
+                        "\ufffd" in self.held_text and self.held_text.count("\ufffd") < 5
+                    ),
+                )
 
         # Hold text as long as it contains part of a banned string
 
